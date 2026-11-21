@@ -18,21 +18,35 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "usart.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "OLED.h"
+#include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef struct __attribute__((packed)) {
+  uint8_t  header;          /* 0xAA */
+  uint8_t  run;             /* 00 暂停 / 01 运行 */
+  uint8_t  dir;             /* 00 正向 / 01 反向 */
+  uint16_t step_ms;         /* 低字节在前，正对 STEP_L / STEP_H */
+  uint8_t  checksum;        /* 前 5 字节之和的低 8 位 */
+} DemoPacket;
+
 
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+static void ledShow(uint8_t idx);
+static void ledStep(void);
+static void UartFeedback(void);
+static void UiRefresh(void);
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -43,6 +57,25 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+#define led_PORT   GPIOB
+static const uint16_t led_pins[3] = { GPIO_PIN_3, GPIO_PIN_4, GPIO_PIN_5 };
+
+static uint8_t  led  ;      /* 当前点亮第几颗：0~2 */
+volatile uint8_t runstate   ;      /* 1 运行 / 0 暂停 */
+volatile uint16_t step ;
+static uint8_t  dir  ;      /* 0 正向 / 1 反向 */
+  /* 切换间隔 ms，今晚先写死，明天改串口 */
+static uint32_t last_tick = 0;
+
+volatile uint8_t ev_dir =0 , ev_run = 0 ;   /* 按键事件，中断里只置位 */
+
+DemoPacket rx_packet;
+volatile uint8_t packet_ready = 0;
+
+static char tx_feedback [64];
+
+volatile uint8_t tx_state = 0;/* 0 串口空闲/ 1 串口正忙 */
+
 
 /* USER CODE END PV */
 
@@ -61,13 +94,11 @@ void SystemClock_Config(void);
   * @brief  The application entry point.
   * @retval int
   */
-
 int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-  uint32_t last_tick = 0;
-  uint8_t led_state = 0;
+
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -88,48 +119,86 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+
+  runstate = 1;   step = 300;   dir = 0;   led = 0;
+  last_tick = HAL_GetTick();
+  ledShow(led);
+  UiRefresh();      /* 先画一帧，屏就不会是黑的 */
+
+  HAL_UART_Receive_IT(&huart1, (uint8_t *)&rx_packet, sizeof(rx_packet));
+
+  OLED_Init( );
+
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+
   while (1)
   {
-    uint32_t now = HAL_GetTick();
-    if(now - last_tick >= 500)
-    {
-      last_tick = now;
-
-      HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_RESET);
-      HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
-      HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET);
-
-      switch(led_state)
-      {
-      case 0:
-        HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_SET);
-        break;
-      case 1:
-        HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
-        break;
-      case 2:
-        HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET);
-        break;
-      default:
-        HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET);
-        break;
-      }
-      led_state = (led_state + 1) % 3;
-    }
-  }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    if (packet_ready) {
+      DemoPacket packet = rx_packet;
+      packet_ready = 0;
+
+      const uint8_t *bytes = (const uint8_t *)&packet;
+      uint8_t expected = (uint8_t)(bytes[0] + bytes[1]        //计算最后面校验位
+                               + bytes[2] + bytes[3] +bytes[4]);
+
+      if (packet.header == 0xAA && packet.checksum == (expected %256)
+          && packet.run <= 1
+          && packet.dir <= 1
+          && packet.step_ms >= 100
+          && packet.step_ms <= 2000)
+      {
+        runstate = packet.run;
+        step = packet.step_ms;
+        dir = packet.dir;
+        UartFeedback();
+        UiRefresh();
+      }
+      else {}/* 帧头/校验和不对，整包丢弃*/
+
+      HAL_UART_Receive_IT(&huart1,
+          (uint8_t *)&rx_packet, sizeof(rx_packet));
+    }
+
+    /* 1) 先处理按键事件：必须放在切灯判断之外，暂停时也要响应 */
+    uint32_t now = HAL_GetTick();
+    static uint32_t last_tick_dir = 0, last_tick_run = 0;
+    if (ev_dir && now - last_tick_dir >= 20)
+    {
+      last_tick_dir = now;
+      ev_dir = 0;
+      dir = !dir;
+      ledShow(led);
+      UiRefresh();
+      UartFeedback();
+    }
+    if (ev_run && now - last_tick_run >= 20)
+    {
+      last_tick_run = now;
+      ev_run = 0;
+      runstate = !runstate;
+      UiRefresh();
+      UartFeedback();
+    }
+
+    /* 2) 灯只在“运行”时推进；GetTick 差值，不用 HAL_Delay */
+    if (runstate && (HAL_GetTick() - last_tick >= step)) {
+      last_tick = HAL_GetTick();
+      ledStep();
+      UiRefresh();
+    }
   }
   /* USER CODE END 3 */
+}
+
 /**
   * @brief System Clock Configuration
   * @retval None
@@ -170,7 +239,56 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+static void ledShow(uint8_t idx)
+{
+  for (uint8_t i = 0; i < 3; i++)
+    HAL_GPIO_WritePin(led_PORT, led_pins[i], GPIO_PIN_RESET);    /* 灭 */
+  HAL_GPIO_WritePin(led_PORT, led_pins[idx], GPIO_PIN_SET);   /* 亮 */
+}
 
+/* 步进：正向 +1、反向 -1，两端折返（3 的模运算天然折返） */
+static void ledStep(void)
+{
+  led = dir ? (uint8_t)((led + 2) % 3) : (uint8_t)((led + 1) % 3);
+  ledShow(led);
+}
+static void UiRefresh(void)
+{
+  char l1[20], l2[20], l3[20], l4[20];
+  snprintf(l1, sizeof l1, "STATE:%4s", runstate ? "RUN" : "STOP");
+  snprintf(l2, sizeof l2, "DIR: %s",   dir ? "REV" : "FWD");
+  snprintf(l3, sizeof l3, "STEP: %u",  (unsigned)step);
+  snprintf(l4, sizeof l4, "LED: %u",   (unsigned)(led + 1));
+  OLED_ShowString(1, 1, l1);  OLED_ShowString(2, 1, l2);
+  OLED_ShowString(3, 1, l3);  OLED_ShowString(4, 1, l4);
+}
+static void UartFeedback(void)
+{
+  if (tx_state) return;                 /* 上一包没发完，丢掉这包，别覆盖缓冲 */
+  snprintf(tx_feedback, sizeof(tx_feedback), "STATE=%4s,DIR=%s,STEP=%u,LED=%u\r\n",
+           runstate ? "RUN" : "STOP", dir ? "REV" : "FWD",
+           (unsigned)step, (unsigned)(led + 1));
+  tx_state = 1;
+  if (HAL_UART_Transmit_IT(&huart1, (uint8_t *)tx_feedback,
+                          (uint16_t)strlen(tx_feedback)) != HAL_OK)
+             {tx_state = 0;}        /* 发送失败，串口置为空闲 */
+}
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == GPIO_PIN_11) ev_dir = 1;
+  else if (GPIO_Pin == GPIO_PIN_12) ev_run = 1;
+}
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    packet_ready = 1;      /* 记这一包收满了 */
+  }
+}
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1) tx_state = 0;   /* 发送完成才放开忙标志 */
+}
 /* USER CODE END 4 */
 
 /**

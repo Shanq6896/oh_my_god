@@ -1,42 +1,54 @@
-# “电控组第二次培训作业”
-- **赵志展**
-- ***20253006896***
+# 电控组第三次培训作业
 
-方式：使用依靠 SysTick 滴答定时器   
-原理：HAL_GetTick()返回系统上电后毫秒时间戳；不原地等待，每次循环对比时间差，到 500ms 才切换 LED，其余时间主循环可以跑别的代码。   
+基于 STM32F103C8T6 + HAL 库的流水灯控制工程：三灯单亮流水、双按键切换方向与暂停、串口 6 字节数据包控制、OLED 四行状态显示、串口中断反馈。
 
-核心代码：   
-uint32_t last_tick = 0;   // 设置初始LED的时间点,32位无序号整形   
-uint8_t led_state = 0;    // 流水灯标记：0=LED0，1=LED1，2=LED2
+## 一、基本信息
 
-while (1)   
-{  
-    uint32_t now = HAL_GetTick();         
-  // 读取当前系统毫秒时间戳，保存到now变量   
- 
-  if(now - last_tick >= 500)    
-   // 判断当前时间 - 上次动作时间 >= 500ms是否成立，成立代表延时时间到   
-  {    
-    last_tick = now;   // 更新“上次动作时间”为当前时间，为下一次计时做准备
+***学号：20253006896***     
+***姓名：赵志展***
+## 二、参考资料与驱动来源
 
-// 先把三个LED全部熄灭，保证同一时间只有一个灯亮，实现流水效果
-HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_RESET);
-HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
-HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET);
+- 《STM32 HAL 库第三次培训指南》（本次培训下发文档）。
+- B 站 UP 主 keysking：HAL 库系列（GPIO、外部中断、串口收发与中断原则）。
+- B 站 UP 主铁头山羊（江协科技）：串口数据包、软件 I²C 与 OLED 移植相关章节。
+- OLED 驱动 `OLED.c / OLED.h / OLED_Font.h`。
+- 工程内另含一份软件 I²C `IIC.c / IIC.h`，其 SCL/SDA 定为 PB0/PB1。
 
-// 根据状态点亮对应LED   
- switch(led_state)   
-{
- case 0:   
-HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_SET); break;     
-case 1:    
-HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET); break;    
-case 2:     
-HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET); break;  
-    }   
-// led自增，对3取模，实现 0→1→2→0 循环   
-    led_state = (led_state + 1) % 3;   
-  }   
-  // ========== 这里可以放其他任务代码 ==========
-  
-}
+## 三、串口反馈格式（自定义）
+
+格式定义：
+
+```
+STATE=<RUN|STOP>,DIR=<FWD|REV>,STEP=<100~2000>,LED=<1|2|3>\r\n
+```
+
+- 字段之间用英文逗号分隔，键值用等号，无空格，行尾固定 `\r\n`（CR+LF）。
+- 编码为 ASCII，串口参数 115200、8 位数据、无校验、1 停止位，与接收数据包一致。
+- `LED` 为当前点亮的灯号（1~3），不是数组下标。
+- 发送时机：串口包校验通过并应用之后；K1、K2 改变方向或运行状态之后。每次切灯不发送日志。
+- 发送方式：`HAL_UART_Transmit_IT()` 非阻塞发送，配 `tx_state` 忙标志，`HAL_UART_TxCpltCallback()` 里清零；上一包未发完时丢弃本次反馈，不排队、不覆盖缓冲区。
+
+典型回包：
+
+```
+STATE=RUN,DIR=FWD,STEP=300,LED=1
+STATE=STOP,DIR=FWD,STEP=300,LED=2
+STATE=RUN,DIR=REV,STEP=1000,LED=3
+```
+
+> 注：屏上 STATE 行为了对齐、避免短串残留，格式化时用了定宽 `%4s`。
+
+## 四、选做说明
+
+本次未做选做项：未使用硬件 I²C，也未把反馈改为 DMA，反馈使用串口中断发送。
+
+## 五、思考题
+没有出现上述问题     
+因为消抖是用 `HAL_GetTick() - last_tick >= step` 做差值判断、不是 `HAL_Delay(step)` 阻塞   
+`while(1)` 每一圈都会过一遍 `if (packet_ready)`、两个按键的 20 ms 窗口和切灯判断，2000 ms 只是 “条件还没到”，CPU 并没有被占住，所以串口包和按键在到达后的下一圈就会被处理，只是延迟一圈循环时间。
+
+
+
+
+
+
